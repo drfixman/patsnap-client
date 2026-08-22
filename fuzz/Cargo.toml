@@ -1,0 +1,22 @@
+[package]
+name = "patsnap-client-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace - a fuzz crate is never a member of the crate it fuzzes.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+patsnap-client = { path = ".." }
+
+[[bin]]
+name = "fuzz_claim_parse"
+path = "fuzz_targets/fuzz_claim_parse.rs"
+test = false
+doc = false
+bench = false

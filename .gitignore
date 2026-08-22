@@ -1,0 +1,8 @@
+**/.DS_Store
+**/.env
+**/.envrc
+**/debug/
+**/target/
+**/.idea
+**/fuzz/**/artifacts/
+**/fuzz/**/corpus/
