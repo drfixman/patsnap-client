@@ -1,8 +1,9 @@
 //! Async client for the [PatSnap Open Platform](https://open.patsnap.com)
 //! patent API.
 //!
-//! PatSnap exposes patent claims, description, bibliography, family, and
-//! search data over a REST API at `https://connect.patsnap.com`.
+//! PatSnap exposes patent claims, description, bibliography, family,
+//! images, PDF, and search data over a REST API at
+//! `https://connect.patsnap.com`.
 //!
 //! # Quick start
 //!
@@ -48,6 +49,13 @@
 //! - [`PatsnapClient::bibliography`] / [`PatsnapClient::simple_bibliography`]
 //!   — title, abstract, dates, parties, IPC/CPC classification.
 //! - [`PatsnapClient::family`] — simple, INPADOC and PatSnap families.
+//! - [`PatsnapClient::abstract_image`] / [`PatsnapClient::abstract_image_batch`]
+//!   — the front-page drawing, as a signed link.
+//! - [`PatsnapClient::fulltext_images`] — every drawing of a publication,
+//!   as signed links.
+//! - [`PatsnapClient::pdf`] / [`PatsnapClient::pdf_batch`] — the full
+//!   document PDF, as a signed link.
+//! - [`PatsnapClient::download`] — the bytes behind one of those links.
 //! - [`PatsnapClient::search`] / [`PatsnapClient::search_count`] — Analytics
 //!   query syntax, with [`query_request`] for the common case.
 //! - [`PatsnapClient::semantic_search`] — free-text similarity search.
@@ -72,9 +80,18 @@ mod claims;
 
 pub use claims::{ParsedClaim, claim_plain_text, parse_claim_html};
 
-/// PatSnap caps `claim-data` batches at 100 patents per request; each
-/// successful result is billed as one credit.
-const CLAIMS_BATCH_LIMIT: usize = 100;
+/// PatSnap caps `claim-data`, `abstract-image` and `pdf-data` batches at 100
+/// patents per request; each successful result is billed as one credit.
+const BATCH_LIMIT: usize = 100;
+
+/// PatSnap's `limit` ceiling for `/basic-patent-data/fulltext-image`.
+const FULLTEXT_IMAGE_LIMIT: u32 = 100;
+
+/// Largest body [`PatsnapClient::download`] reads: 64 MiB. The cap bounds
+/// the memory one call can take, so a broken or hostile answer cannot fill
+/// memory; 64 MiB leaves room for a long full-document PDF. A body past it
+/// fails with [`PatsnapError::Api`].
+pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 /// PatSnap's documented `query_text` ceiling for both
 /// `/search/patent/query-search-patent` and
@@ -109,6 +126,13 @@ pub struct ClientConfig {
     pub timeout: Duration,
     /// Maximum requests in flight at once. Clamped to at least 1.
     pub max_concurrent: usize,
+    /// The hosts [`PatsnapClient::download`] accepts, each matched exactly
+    /// or as a parent domain (`patsnap.com` accepts
+    /// `data-pdf.patsnap.com`). Live links are on
+    /// `data-abstract-image.patsnap.com`, `data-fulltext-image.patsnap.com`
+    /// and `data-pdf.patsnap.com`; PatSnap's reference pages also show
+    /// `open.zhihuiya.com`.
+    pub file_hosts: Vec<String>,
 }
 
 impl Default for ClientConfig {
@@ -124,6 +148,7 @@ impl Default for ClientConfig {
             ],
             timeout: Duration::from_secs(20),
             max_concurrent: 8,
+            file_hosts: vec!["patsnap.com".to_string(), "zhihuiya.com".to_string()],
         }
     }
 }
@@ -752,10 +777,113 @@ struct PatentSearchPnResultsWire {
     results: Vec<PatentNumberMatch>,
 }
 
+/// The front-page drawing of a patent - `{num, path}` in
+/// `/basic-patent-data/abstract-image`.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct AbstractDrawing {
+    /// PatSnap's image number, e.g. `"0001"`.
+    pub num: Option<String>,
+    /// A signed link to the PNG image on `data-abstract-image.patsnap.com`,
+    /// signed for 1 hour (seen live). Pass it to
+    /// [`PatsnapClient::download`] for the bytes.
+    pub path: Option<String>,
+}
+
+/// One patent's abstract image, as returned by
+/// `/basic-patent-data/abstract-image`.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct PatentAbstractImage {
+    pub pn: String,
+    pub patent_id: String,
+    /// `None` when PatSnap sent no drawing for the patent.
+    pub abstract_drawing: Option<AbstractDrawing>,
+}
+
+/// One drawing of a patent, as returned by
+/// `/basic-patent-data/fulltext-image`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[non_exhaustive]
+pub struct FulltextImage {
+    /// A signed link to the PNG image on `data-fulltext-image.patsnap.com`,
+    /// signed for 7 days (seen live). Pass it to
+    /// [`PatsnapClient::download`] for the bytes.
+    pub path: String,
+    /// PatSnap's image type, e.g. `drawing`.
+    pub image_type: Option<String>,
+}
+
+/// Every drawing of one patent - see [`PatsnapClient::fulltext_images`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PatentFulltextImages {
+    pub pn: String,
+    pub patent_id: String,
+    /// In PatSnap's order; empty when the patent has no drawings.
+    pub images: Vec<FulltextImage>,
+}
+
+/// Wire shape of one `/basic-patent-data/fulltext-image` page.
+#[derive(Deserialize)]
+struct FulltextImagePageWire {
+    pn: String,
+    patent_id: String,
+    total_search_result_count: Option<u64>,
+    #[serde(default)]
+    fulltext_image: Vec<FulltextImage>,
+}
+
+/// Wire body of `/basic-patent-data/fulltext-image`.
+#[derive(Serialize)]
+struct FulltextImageRequestWire<'a> {
+    patent_number: &'a str,
+    limit: u32,
+    offset: u32,
+}
+
+/// `{path}` in `/basic-patent-data/pdf-data`.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct PdfLink {
+    /// A signed link to the full-document PDF on `data-pdf.patsnap.com`,
+    /// signed for 10 days (seen live). Pass it to
+    /// [`PatsnapClient::download`] for the bytes.
+    pub path: Option<String>,
+}
+
+/// One patent's PDF, as returned by `/basic-patent-data/pdf-data`.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct PatentPdf {
+    pub pn: String,
+    pub patent_id: String,
+    /// Set only when PatSnap substituted a family member's PDF for the
+    /// requested publication's own (`replace_by_related`).
+    pub pn_related: Option<String>,
+    pub pdf: Option<PdfLink>,
+}
+
+/// The body behind a PatSnap file link. Returned by
+/// [`PatsnapClient::download`]. The bytes are PatSnap's, undecoded.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PatsnapFile {
+    /// The `Content-Type` the file host sent; `application/octet-stream`
+    /// when it sent none.
+    pub content_type: String,
+    /// The response body, at most [`MAX_FILE_BYTES`] long.
+    pub bytes: Vec<u8>,
+}
+
 /// Async client for the PatSnap Open Platform.
 #[derive(Debug, Clone)]
 pub struct PatsnapClient {
     http: reqwest::Client,
+    /// Fetches file links: no `Authorization` header, so the API key never
+    /// reaches a file host, and no redirects, so only a checked host is
+    /// ever contacted.
+    files: reqwest::Client,
     config: ClientConfig,
     semaphore: Arc<Semaphore>,
     last_start: Arc<Mutex<Option<Instant>>>,
@@ -796,11 +924,17 @@ impl PatsnapClient {
             .timeout(config.timeout)
             .build()
             .expect("reqwest client builder has no fallible input here");
+        let files = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client builder has no fallible input here");
 
         let max_concurrent = config.max_concurrent.max(1);
 
         Self {
             http,
+            files,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             last_start: Arc::new(Mutex::new(None)),
             config,
@@ -830,19 +964,194 @@ impl PatsnapClient {
         pns: &[String],
         fallback: FamilyFallback,
     ) -> Result<Vec<PatentClaims>, PatsnapError> {
-        if pns.is_empty() {
-            return Ok(Vec::new());
-        }
+        self.get_batch("/basic-patent-data/claim-data", pns, Some(fallback))
+            .await
+    }
 
-        let mut all = Vec::with_capacity(pns.len());
-        for chunk in pns.chunks(CLAIMS_BATCH_LIMIT) {
-            let query = [
-                ("patent_number", chunk.join(",")),
-                ("replace_by_related", fallback.query_value().to_string()),
-            ];
-            let page: Vec<PatentClaims> = self
-                .request(Method::GET, "/basic-patent-data/claim-data", &query, None)
+    /// Fetches one patent's front-page drawing - a thin wrapper over
+    /// [`Self::abstract_image_batch`] for a single `pn`. An empty result is
+    /// [`PatsnapError::NotFound`].
+    #[tracing::instrument(skip(self))]
+    pub async fn abstract_image(&self, pn: &str) -> Result<PatentAbstractImage, PatsnapError> {
+        first_or_not_found(self.abstract_image_batch(&[pn.to_string()]).await?)
+    }
+
+    /// Fetches the front-page drawing of any number of patents -
+    /// `/basic-patent-data/abstract-image`, chunked at PatSnap's
+    /// 100-patents-per-call cap like [`Self::claims_batch`]. Each result
+    /// carries a signed link, not the image; [`Self::download`] fetches it.
+    #[tracing::instrument(skip(self, pns))]
+    pub async fn abstract_image_batch(
+        &self,
+        pns: &[String],
+    ) -> Result<Vec<PatentAbstractImage>, PatsnapError> {
+        self.get_batch("/basic-patent-data/abstract-image", pns, None)
+            .await
+    }
+
+    /// Fetches one patent's PDF link - a thin wrapper over
+    /// [`Self::pdf_batch`] for a single `pn`. An empty result is
+    /// [`PatsnapError::NotFound`].
+    #[tracing::instrument(skip(self))]
+    pub async fn pdf(&self, pn: &str, fallback: FamilyFallback) -> Result<PatentPdf, PatsnapError> {
+        first_or_not_found(self.pdf_batch(&[pn.to_string()], fallback).await?)
+    }
+
+    /// Fetches the full-document PDF link of any number of patents -
+    /// `/basic-patent-data/pdf-data`, chunked at PatSnap's
+    /// 100-patents-per-call cap like [`Self::claims_batch`]. Each result
+    /// carries a signed link, not the PDF; [`Self::download`] fetches it.
+    #[tracing::instrument(skip(self, pns))]
+    pub async fn pdf_batch(
+        &self,
+        pns: &[String],
+        fallback: FamilyFallback,
+    ) -> Result<Vec<PatentPdf>, PatsnapError> {
+        self.get_batch("/basic-patent-data/pdf-data", pns, Some(fallback))
+            .await
+    }
+
+    /// Fetches every drawing of one patent -
+    /// `/basic-patent-data/fulltext-image`, paged at PatSnap's 100-image
+    /// `limit` until PatSnap's total is reached or a page comes back short
+    /// (the only stop when PatSnap sends no total). Each image carries a signed
+    /// link, not the image; [`Self::download`] fetches it. A patent without
+    /// drawings gives an empty list.
+    #[tracing::instrument(skip(self), fields(images = field::Empty))]
+    pub async fn fulltext_images(&self, pn: &str) -> Result<PatentFulltextImages, PatsnapError> {
+        if pn.is_empty() {
+            return Err(PatsnapError::Api("pn must not be empty".to_string()));
+        }
+        let mut images = Vec::new();
+        let mut offset = 0;
+        loop {
+            let wire = FulltextImageRequestWire {
+                patent_number: pn,
+                limit: FULLTEXT_IMAGE_LIMIT,
+                offset,
+            };
+            let body = serde_json::to_value(&wire)
+                .expect("FulltextImageRequestWire always serializes to JSON");
+            let page: FulltextImagePageWire = self
+                .request(
+                    Method::POST,
+                    "/basic-patent-data/fulltext-image",
+                    &[],
+                    Some(body),
+                )
                 .await?;
+            let page_len = page.fulltext_image.len() as u32;
+            images.extend(page.fulltext_image);
+            let reached_total = page
+                .total_search_result_count
+                .is_some_and(|total| images.len() as u64 >= total);
+            if page_len < FULLTEXT_IMAGE_LIMIT || reached_total {
+                Span::current().record("images", images.len());
+                return Ok(PatentFulltextImages {
+                    pn: page.pn,
+                    patent_id: page.patent_id,
+                    images,
+                });
+            }
+            offset += page_len;
+        }
+    }
+
+    /// Fetches the body behind a file link from [`Self::abstract_image`],
+    /// [`Self::fulltext_images`] or [`Self::pdf`]: a plain `GET` of the
+    /// signed link, without the API key. Returns the bytes and the content
+    /// type the file host sent; nothing is decoded or converted.
+    ///
+    /// Refused with [`PatsnapError::Api`] before any request is sent: a link
+    /// that is not an `https` URL on one of [`ClientConfig::file_hosts`]
+    /// (`http` is accepted for a loopback address only). A redirect is not
+    /// followed and fails with [`PatsnapError::Api`], as does a body longer
+    /// than [`MAX_FILE_BYTES`]. A link is signed for a limited time (see the
+    /// `path` fields); past it, fetch a fresh link from the endpoint. 429,
+    /// 5xx and transport
+    /// faults are retried on [`ClientConfig::retry_backoff`].
+    #[tracing::instrument(
+        skip(self, url),
+        fields(host = field::Empty, http_status = field::Empty, bytes = field::Empty)
+    )]
+    pub async fn download(&self, url: &str) -> Result<PatsnapFile, PatsnapError> {
+        let url = check_file_url(url, &self.config.file_hosts)?;
+        let span = Span::current();
+        span.record("host", url.host_str().unwrap_or_default());
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
+
+        let mut attempt = 0;
+        loop {
+            match self.files.get(url.clone()).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    span.record("http_status", status.as_u16());
+                    let retryable =
+                        status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                    if retryable && attempt < self.config.retry_backoff.len() {
+                        warn!(
+                            attempt = attempt + 1,
+                            %status,
+                            "PatSnap file host retryable HTTP status, will retry"
+                        );
+                        tokio::time::sleep(self.config.retry_backoff[attempt]).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    if status == StatusCode::NOT_FOUND {
+                        return Err(PatsnapError::NotFound);
+                    }
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        return Err(PatsnapError::RateLimit(status_and_body(response).await));
+                    }
+                    if !status.is_success() {
+                        return Err(PatsnapError::Api(status_and_body(response).await));
+                    }
+                    let file = read_file(response).await?;
+                    span.record("bytes", file.bytes.len());
+                    return Ok(file);
+                }
+                Err(err) => {
+                    // `without_url`: the signed link is a credential until it
+                    // expires, so it stays out of logs and errors.
+                    let err = err.without_url();
+                    if is_transport_retryable(&err) && attempt < self.config.retry_backoff.len() {
+                        warn!(
+                            attempt = attempt + 1,
+                            error = %err,
+                            "PatSnap file host transport error, will retry"
+                        );
+                        tokio::time::sleep(self.config.retry_backoff[attempt]).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(PatsnapError::Network(err.to_string()));
+                }
+            }
+        }
+    }
+
+    /// GETs `path` for any number of patents, chunked at [`BATCH_LIMIT`]
+    /// and joined by commas into `patent_number`, with `replace_by_related`
+    /// when the endpoint takes it. Chunks are fetched in input order; an
+    /// empty `pns` issues no request.
+    async fn get_batch<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        pns: &[String],
+        fallback: Option<FamilyFallback>,
+    ) -> Result<Vec<T>, PatsnapError> {
+        let mut all = Vec::with_capacity(pns.len());
+        for chunk in pns.chunks(BATCH_LIMIT) {
+            let mut query = vec![("patent_number", chunk.join(","))];
+            if let Some(fallback) = fallback {
+                query.push(("replace_by_related", fallback.query_value().to_string()));
+            }
+            let page: Vec<T> = self.request(Method::GET, path, &query, None).await?;
             all.extend(page);
         }
         Ok(all)
@@ -1139,6 +1448,79 @@ fn first_or_not_found<T>(results: Vec<T>) -> Result<T, PatsnapError> {
     results.into_iter().next().ok_or(PatsnapError::NotFound)
 }
 
+/// Checks a file link before anything is sent: an absolute `https` URL
+/// whose host is one of `hosts` or under one of them (`http` only for a
+/// loopback address). The error names the host, never the signed query.
+fn check_file_url(url: &str, hosts: &[String]) -> Result<reqwest::Url, PatsnapError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|err| PatsnapError::Api(format!("not a file link: {err}")))?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let loopback = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    match parsed.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        scheme => {
+            return Err(PatsnapError::Api(format!(
+                "file link scheme {scheme:?} refused: https only"
+            )));
+        }
+    }
+    let allowed = hosts.iter().any(|allowed| {
+        let allowed = allowed.to_ascii_lowercase();
+        !allowed.is_empty()
+            && (host == allowed
+                || host
+                    .strip_suffix(&allowed)
+                    .is_some_and(|prefix| prefix.ends_with('.')))
+    });
+    if !allowed {
+        return Err(PatsnapError::Api(format!(
+            "file link host {host:?} is not one of {hosts:?}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Reads a file body, failing with [`PatsnapError::Api`] past
+/// [`MAX_FILE_BYTES`] - up front when `Content-Length` says so, otherwise
+/// as soon as the streamed body crosses it.
+async fn read_file(mut response: reqwest::Response) -> Result<PatsnapFile, PatsnapError> {
+    let status = response.status().as_u16();
+    let too_large =
+        || PatsnapError::Api(format!("{status}: file body over {MAX_FILE_BYTES} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_FILE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| PatsnapError::Network(err.without_url().to_string()))?
+    {
+        if bytes.len() + chunk.len() > MAX_FILE_BYTES {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(PatsnapFile {
+        content_type,
+        bytes,
+    })
+}
+
 /// `"{status}: {body}"` for a response that failed on its HTTP status - the
 /// same message shape epo-client and lens-org-client use, so a caller can
 /// classify by the leading digits and still read what the server said.
@@ -1345,6 +1727,7 @@ mod tests {
         );
         assert_eq!(config.timeout, Duration::from_secs(20));
         assert_eq!(config.max_concurrent, 8);
+        assert_eq!(config.file_hosts, vec!["patsnap.com", "zhihuiya.com"]);
     }
 
     #[test]
@@ -1718,6 +2101,47 @@ mod tests {
             PatsnapError::Api(msg) => assert!(msg.contains("pn") || msg.contains("apno")),
             other => panic!("expected Api error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn only_https_links_on_file_hosts_pass() {
+        let hosts = ClientConfig::default().file_hosts;
+        for good in [
+            "https://open.patsnap.com/abstract-image/CN/A/10/41/69/18/6/00000001_0001.png?sign=x",
+            "https://data-abstract-image.patsnap.com/US/B2/a.png?sign=x&response-expires=y",
+            "https://data-fulltext-image.patsnap.com/CN/A/a.png?sign=x",
+            "https://data-pdf.patsnap.com/US/B2/US_11205304_B2.pdf?sign=x",
+            "https://open.zhihuiya.com/a.png?q-sign-time=1",
+            "https://OPEN.PATSNAP.COM/a.pdf",
+        ] {
+            assert!(check_file_url(good, &hosts).is_ok(), "{good:?} must pass");
+        }
+        for bad in [
+            "http://open.patsnap.com/a.png",
+            "https://evilpatsnap.com/a.png",
+            "https://patsnap.com.evil.example/a.png",
+            "https://open.patsnap.com@evil.example/a.png",
+            "file:///etc/passwd",
+            "ftp://open.patsnap.com/a.png",
+            "/abstract-image/a.png",
+            "http://127.0.0.1/a.png",
+            "",
+        ] {
+            assert!(
+                matches!(check_file_url(bad, &hosts), Err(PatsnapError::Api(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        let loopback = vec!["127.0.0.1".to_string(), "[::1]".to_string()];
+        assert!(check_file_url("http://127.0.0.1:8080/a.png", &loopback).is_ok());
+        assert!(check_file_url("http://[::1]:8080/a.png", &loopback).is_ok());
+    }
+
+    #[test]
+    fn file_link_errors_never_carry_the_signature() {
+        let hosts = ClientConfig::default().file_hosts;
+        let err = check_file_url("https://evil.example/a.png?sign=secret", &hosts).unwrap_err();
+        assert!(!err.to_string().contains("secret"), "{err}");
     }
 
     #[tokio::test]

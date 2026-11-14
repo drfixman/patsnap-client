@@ -4,16 +4,16 @@
 [![docs.rs](https://docs.rs/patsnap-client/badge.svg)](https://docs.rs/patsnap-client)
 
 Async Rust client for the [PatSnap Open Platform](https://open.patsnap.com)
-patent API — claims, description, bibliography, family, and search — with
-API-key auth, request pacing, bounded concurrency, and typed errors. v0
-exposes the five basic-data and four search endpoints listed below; the
-base URL is `https://connect.patsnap.com`.
+patent API — claims, description, bibliography, family, images, PDF, and
+search — with API-key auth, request pacing, bounded concurrency, and typed
+errors. v0 exposes the eight basic-data and four search endpoints listed
+below; the base URL is `https://connect.patsnap.com`.
 
 ## Installation
 
 ```toml
 [dependencies]
-patsnap-client = "0.0.1"
+patsnap-client = "0.0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -69,13 +69,32 @@ GET:
 - `/basic-patent-data/bibliography`
 - `/basic-patent-data/simple-bibliography`
 - `/basic-patent-data/patent-family`
+- `/basic-patent-data/abstract-image`
+- `/basic-patent-data/pdf-data`
 
 POST:
 
+- `/basic-patent-data/fulltext-image`
 - `/search/patent/query-search-patent`
 - `/search/patent/query-search-count`
 - `/search/patent/patent-search-pn`
 - `/search/patent/semantic-search-patent`
+
+## Images and PDF
+
+The image and PDF endpoints return signed links, not files. Live links
+are signed for 1 hour (abstract image), 7 days (drawings) and 10 days
+(PDF).
+`download(link)` fetches the bytes without sending the API key, only from
+`https` hosts on `ClientConfig::file_hosts`, and caps the body at 64 MiB.
+
+```rust
+let drawings = client.fulltext_images("CN116420141A").await?;
+if let Some(first) = drawings.images.first() {
+    let png = client.download(&first.path).await?;
+    println!("{} bytes of {}", png.bytes.len(), png.content_type);
+}
+```
 
 ## Credits
 

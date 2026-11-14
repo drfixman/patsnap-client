@@ -1,9 +1,9 @@
 [package]
 name = "patsnap-client"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 publish = true
-description = "Async client for the PatSnap Open Platform patent API: claims, description, bibliography, family, search."
+description = "Async client for the PatSnap Open Platform patent API: claims, description, bibliography, family, images, PDF, search."
 license = "MIT"
 repository = "https://github.com/drfixman/patsnap-client"
 homepage = "https://github.com/drfixman/patsnap-client"
