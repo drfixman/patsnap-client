@@ -10,8 +10,317 @@ use patsnap::{
     SemanticSearchRequest, query_request,
 };
 use serde_json::json;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Pins that `abstract_image` reads the nested `abstract_drawing` object
+/// (`num` and `path`), the shape of PatSnap's own example.
+#[tokio::test]
+async fn abstract_image_happy_path_parses_the_drawing() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/basic-patent-data/abstract-image"))
+        .and(query_param("patent_number", "CN104169186A"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(json!([{
+                "pn": "CN104169186A",
+                "patent_id": "fdbca633-63df-4c0b-8597-3f6c5e3a2748",
+                "abstract_drawing": {
+                    "num": "0001",
+                    "path": "https://open.patsnap.com/abstract-image/CN/A/10/41/69/18/6/00000001_0001.png?sign=x"
+                }
+            }]))),
+        )
+        .mount(&mock)
+        .await;
+
+    let image = client_for(&mock)
+        .abstract_image("CN104169186A")
+        .await
+        .expect("mock returns one abstract image");
+
+    let drawing = image.abstract_drawing.expect("drawing present");
+    assert_eq!(drawing.num.as_deref(), Some("0001"));
+    assert!(drawing.path.unwrap().ends_with(".png?sign=x"));
+}
+
+/// Pins that `abstract_image_batch` chunks at PatSnap's 100-per-call cap.
+#[tokio::test]
+async fn abstract_image_batch_chunks_at_one_hundred() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/basic-patent-data/abstract-image"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(json!([]))))
+        .mount(&mock)
+        .await;
+
+    let pns: Vec<String> = (0..150).map(|n| format!("US{n:07}B2")).collect();
+    client_for(&mock)
+        .abstract_image_batch(&pns)
+        .await
+        .expect("mock returns an empty page for each chunk");
+
+    let requests = mock.received_requests().await.unwrap();
+    let counts: Vec<usize> = requests.iter().map(patent_number_count).collect();
+    assert_eq!(counts, vec![100, 50]);
+}
+
+/// Pins that `pdf` sends `replace_by_related` and reads `pdf.path` and
+/// `pn_related`.
+#[tokio::test]
+async fn pdf_happy_path_parses_link_and_substitute() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/basic-patent-data/pdf-data"))
+        .and(query_param("replace_by_related", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(json!([{
+                "pn": "US11205304B2",
+                "pdf": {"path": "https://open.patsnap.com/pdf/watermark/a.pdf?sign=x"},
+                "patent_id": "718ead9c-4f3c-4674-8f5a-24e126827269",
+                "pn_related": "US11205304B1"
+            }]))),
+        )
+        .mount(&mock)
+        .await;
+
+    let pdf = client_for(&mock)
+        .pdf("US11205304B2", FamilyFallback::Yes)
+        .await
+        .expect("mock only matches replace_by_related=1");
+
+    assert_eq!(pdf.pn_related.as_deref(), Some("US11205304B1"));
+    assert!(pdf.pdf.unwrap().path.unwrap().ends_with(".pdf?sign=x"));
+}
+
+/// Pins that `fulltext_images` pages at 100 until PatSnap's total is
+/// reached: 150 drawings come back from two requests, offsets 0 and 100.
+#[tokio::test]
+async fn fulltext_images_pages_until_the_total() {
+    let mock = MockServer::start().await;
+    for (offset, count) in [(0, 100), (100, 50)] {
+        let images: Vec<_> = (offset..offset + count)
+            .map(|n| json!({"path": format!("https://data-fulltext-image.patsnap.com/{n}.png"), "image_type": "drawing"}))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/basic-patent-data/fulltext-image"))
+            .and(body_partial_json(json!({
+                "patent_number": "CN116420141A", "limit": 100, "offset": offset
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(json!({
+                "pn": "CN116420141A",
+                "patent_id": "fdbca633-63df-4c0b-8597-3f6c5e3a2748",
+                "result_count": count,
+                "total_search_result_count": 150,
+                "fulltext_image": images
+            }))))
+            .expect(1)
+            .mount(&mock)
+            .await;
+    }
+
+    let drawings = client_for(&mock)
+        .fulltext_images("CN116420141A")
+        .await
+        .expect("mock returns two pages");
+
+    assert_eq!(drawings.images.len(), 150);
+    assert_eq!(drawings.images[149].image_type.as_deref(), Some("drawing"));
+    assert!(drawings.images[149].path.ends_with("/149.png"));
+    mock.verify().await;
+}
+
+/// Pins that a missing total does not stop paging after a full page: the
+/// short second page is the stop.
+#[tokio::test]
+async fn fulltext_images_without_a_total_pages_until_a_short_page() {
+    let mock = MockServer::start().await;
+    for (offset, count) in [(0, 100), (100, 3)] {
+        let images: Vec<_> = (offset..offset + count)
+            .map(|n| json!({"path": format!("https://data-fulltext-image.patsnap.com/{n}.png"), "image_type": "drawing"}))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/basic-patent-data/fulltext-image"))
+            .and(body_partial_json(json!({"offset": offset})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(json!({
+                "pn": "CN116420141A",
+                "patent_id": "fdbca633-63df-4c0b-8597-3f6c5e3a2748",
+                "fulltext_image": images
+            }))))
+            .expect(1)
+            .mount(&mock)
+            .await;
+    }
+
+    let drawings = client_for(&mock)
+        .fulltext_images("CN116420141A")
+        .await
+        .expect("mock returns two pages");
+
+    assert_eq!(drawings.images.len(), 103);
+    mock.verify().await;
+}
+
+/// Pins that a patent without drawings is an empty list, not an error.
+#[tokio::test]
+async fn fulltext_images_without_drawings_is_empty() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/basic-patent-data/fulltext-image"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(json!({
+            "pn": "CN116420141A",
+            "patent_id": "fdbca633-63df-4c0b-8597-3f6c5e3a2748",
+            "result_count": 0,
+            "total_search_result_count": 0,
+            "fulltext_image": []
+        }))))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let drawings = client_for(&mock)
+        .fulltext_images("CN116420141A")
+        .await
+        .expect("an empty list is not an error");
+
+    assert!(drawings.images.is_empty());
+    mock.verify().await;
+}
+
+/// Pins that `download` returns the body and content type, and never sends
+/// the API key to the file host.
+#[tokio::test]
+async fn download_returns_bytes_without_the_api_key() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/abstract-image/0001.png"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"\x89PNG\r\n\x1a\n".to_vec(), "image/png"),
+        )
+        .mount(&mock)
+        .await;
+
+    let file = file_client_for(&mock, vec![])
+        .download(&format!("{}/abstract-image/0001.png?sign=x", mock.uri()))
+        .await
+        .expect("mock serves the file");
+
+    assert_eq!(file.content_type, "image/png");
+    assert_eq!(file.bytes, b"\x89PNG\r\n\x1a\n");
+    let requests = mock.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("authorization").is_none());
+}
+
+/// Pins that a link on a host outside `file_hosts` is refused before any
+/// request is sent.
+#[tokio::test]
+async fn download_refuses_a_foreign_host_without_a_request() {
+    let mock = MockServer::start().await;
+
+    let err = client_for(&mock)
+        .download(&format!("{}/a.png", mock.uri()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, PatsnapError::Api(_)), "got {err:?}");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 0);
+}
+
+/// Pins that a redirect is not followed, so only a checked host is ever
+/// contacted.
+#[tokio::test]
+async fn download_does_not_follow_a_redirect() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/a.png"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "https://evil.example/a.png"),
+        )
+        .mount(&mock)
+        .await;
+
+    let err = file_client_for(&mock, vec![])
+        .download(&format!("{}/a.png", mock.uri()))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, PatsnapError::Api(msg) if msg.starts_with("302")),
+        "got {err:?}"
+    );
+}
+
+/// Pins that a 404 from the file host is `NotFound` and a 500 is retried.
+#[tokio::test]
+async fn download_maps_404_and_retries_500() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/gone.png"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/flaky.png"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/flaky.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"ok".to_vec(), "image/png"))
+        .mount(&mock)
+        .await;
+
+    let client = file_client_for(&mock, vec![Duration::from_millis(1)]);
+    let err = client
+        .download(&format!("{}/gone.png", mock.uri()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PatsnapError::NotFound), "got {err:?}");
+
+    let file = client
+        .download(&format!("{}/flaky.png", mock.uri()))
+        .await
+        .expect("second attempt succeeds");
+    assert_eq!(file.bytes, b"ok");
+}
+
+/// Pins that a body over `MAX_FILE_BYTES` fails instead of filling memory.
+#[tokio::test]
+async fn download_refuses_a_body_over_the_cap() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/huge.pdf"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![0u8; patsnap::MAX_FILE_BYTES + 1], "application/pdf"),
+        )
+        .mount(&mock)
+        .await;
+
+    let err = file_client_for(&mock, vec![])
+        .download(&format!("{}/huge.pdf", mock.uri()))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, PatsnapError::Api(msg) if msg.contains("over")),
+        "got {err:?}"
+    );
+}
+
+/// Builds a client whose `file_hosts` accepts the mock's loopback host.
+fn file_client_for(mock: &MockServer, retry_backoff: Vec<Duration>) -> PatsnapClient {
+    PatsnapClient::with_config(
+        "sk-test-key".to_string(),
+        ClientConfig {
+            base_url: mock.uri(),
+            retry_backoff,
+            file_hosts: vec!["127.0.0.1".to_string()],
+            ..ClientConfig::default()
+        },
+    )
+}
 
 /// Pins that `claims` deserializes every `PatentClaims` field, including a
 /// nested `ClaimFragment`, from a realistic `claim-data` body.

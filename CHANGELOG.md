@@ -4,6 +4,20 @@ All notable changes to this crate are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.0.2] - 2026-11-14
+
+- `abstract_image` / `abstract_image_batch`: the front-page drawing of a
+  patent, as PatSnap's signed link.
+- `fulltext_images`: every drawing of a patent, as signed links, paged
+  until PatSnap's total is reached.
+- `pdf` / `pdf_batch`: the full-document PDF, as a signed link, with
+  `FamilyFallback`.
+- `download`: the bytes and content type behind one of those links. Only
+  `https` links on `ClientConfig::file_hosts` (`patsnap.com`,
+  `zhihuiya.com` and their subdomains) are fetched. The API key is never
+  sent, redirects are not followed, and bodies are capped at
+  `MAX_FILE_BYTES` (64 MiB).
+
 ## [0.0.1] - 2026-08-22
 
 Initial public release.
@@ -40,4 +54,5 @@ Initial public release.
   `claim_count`. `query_request` / `parse_search_response` so recorded
   bodies parse without a live client.
 
+[0.0.2]: https://github.com/drfixman/patsnap-client/releases/tag/v0.0.2
 [0.0.1]: https://github.com/drfixman/patsnap-client/releases/tag/v0.0.1

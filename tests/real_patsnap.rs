@@ -38,6 +38,10 @@ const DE_PN: &str = "DE3106419A1";
 /// `basic-patent-data/patent-family` and `basic-patent-data/description-data`.
 const JP_PN: &str = "JP1999068462A";
 
+/// A CN publication - the `patent_number` example for
+/// `basic-patent-data/fulltext-image`.
+const FULLTEXT_IMAGE_PN: &str = "CN116420141A";
+
 /// A publication number no authority has issued - well past the roughly
 /// twelve million US utility patents granted to date, but still shaped like
 /// a real one so PatSnap treats it as a lookup rather than a malformed
@@ -380,6 +384,110 @@ async fn not_found_real() {
         matches!(err, PatsnapError::NotFound),
         "expected NotFound for {BOGUS_PN}, got {err:?}"
     );
+}
+
+/// Does `/basic-patent-data/claim-data` need the kind code? Each CN
+/// publication with and without it; CN108977442B is PatSnap's own example.
+#[tokio::test]
+#[ignore]
+async fn claims_kind_code_real() {
+    init_tracing();
+    for pn in ["CN108977442B", "CN108977442", "CN120230530", "CN120230530A"] {
+        let raw = get_json(
+            reqwest::Method::GET,
+            "/basic-patent-data/claim-data",
+            &[
+                ("patent_number", pn.to_string()),
+                ("replace_by_related", "0".to_string()),
+            ],
+            None,
+        )
+        .await;
+        println!("claim-data raw for {pn}: {raw:#?}");
+    }
+}
+
+/// Confirms the three image endpoints parse and that `download` fetches
+/// each kind of link: the abstract image and a drawing as PNG, the PDF as
+/// PDF. Prints every raw answer first.
+#[tokio::test]
+#[ignore]
+async fn images_real() {
+    init_tracing();
+    let client = client();
+
+    let raw = get_json(
+        reqwest::Method::GET,
+        "/basic-patent-data/abstract-image",
+        &[("patent_number", US_PN.to_string())],
+        None,
+    )
+    .await;
+    println!("abstract-image raw for {US_PN}: {raw:#?}");
+    let abstract_image = client
+        .abstract_image(US_PN)
+        .await
+        .expect("abstract_image should succeed for a known-good publication");
+    dump_parsed("abstract_image", &abstract_image);
+    let link = abstract_image
+        .abstract_drawing
+        .and_then(|d| d.path)
+        .expect("abstract image link present");
+    let png = client
+        .download(&link)
+        .await
+        .expect("abstract image downloads");
+    println!(
+        "abstract image: {} bytes, {}",
+        png.bytes.len(),
+        png.content_type
+    );
+    assert!(
+        png.bytes.starts_with(b"\x89PNG"),
+        "abstract image is not a PNG"
+    );
+
+    let raw = get_json(
+        reqwest::Method::POST,
+        "/basic-patent-data/fulltext-image",
+        &[],
+        Some(serde_json::json!({"patent_number": FULLTEXT_IMAGE_PN, "limit": 100, "offset": 0})),
+    )
+    .await;
+    println!("fulltext-image raw for {FULLTEXT_IMAGE_PN}: {raw:#?}");
+    let drawings = client
+        .fulltext_images(FULLTEXT_IMAGE_PN)
+        .await
+        .expect("fulltext_images should succeed for PatSnap's own example");
+    dump_parsed("fulltext_images", &drawings);
+    let first = drawings.images.first().expect("at least one drawing");
+    let png = client
+        .download(&first.path)
+        .await
+        .expect("drawing downloads");
+    println!("drawing: {} bytes, {}", png.bytes.len(), png.content_type);
+    assert!(png.bytes.starts_with(b"\x89PNG"), "drawing is not a PNG");
+
+    let raw = get_json(
+        reqwest::Method::GET,
+        "/basic-patent-data/pdf-data",
+        &[
+            ("patent_number", US_PN.to_string()),
+            ("replace_by_related", "0".to_string()),
+        ],
+        None,
+    )
+    .await;
+    println!("pdf-data raw for {US_PN}: {raw:#?}");
+    let pdf = client
+        .pdf(US_PN, FamilyFallback::No)
+        .await
+        .expect("pdf should succeed for a known-good publication");
+    dump_parsed("pdf", &pdf);
+    let link = pdf.pdf.and_then(|p| p.path).expect("pdf link present");
+    let file = client.download(&link).await.expect("pdf downloads");
+    println!("pdf: {} bytes, {}", file.bytes.len(), file.content_type);
+    assert!(file.bytes.starts_with(b"%PDF"), "pdf is not a PDF");
 }
 
 /// Initializes a `tracing` subscriber once per process, so the client's
